@@ -1,0 +1,13 @@
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+.env
+.idea/
+*.iml
+.DS_Store
+htmlcov/
+.coverage
+dist/
+build/
