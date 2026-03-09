@@ -1,51 +1,41 @@
-
-from langchain_classic.memory import ConversationBufferWindowMemory
-from langchain_core.messages import SystemMessage
-from config.setting import MAX_HISTORY_MESSAGES
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_community.chat_message_histories import ChatMessageHistory  # or use your own persistent one
 
 class AgentMemory:
-    """
-    Wraps LangChain's conversationBufferWindowMemory.
-    
-    ConversationBufferWindowMemory keeps the last K exchanges 
-    in memory - exactly what our MAX_HISTORY_MESSAGES setting controls.
-    
-    LangChain memory automatically handles: 
-      - Storing user messages
-      - Storing AI responses
-      - Formatting history for the LLM
-      - Trimming old messages (via the k parameter) 
-    """
+    def __init__(self, window_size: int = 10):
+        # In-memory history (replace with Redis, DynamoDB, Filesystem, etc. for persistence)
+        self.chat_history = ChatMessageHistory()
 
-    def __init__(self,system_prompt: str= ""):
-        # k = number of conversation Exchanges to keep (1 exchange = 1 user + 1 AI)
-        # so k=10 keeps 20 messages in total
-        self.memory = ConversationBufferWindowMemory(
-            k = MAX_HISTORY_MESSAGES //2,
-            memory_key="chat_history",     # key used in the prompt templates
-            return_messages=True,          # return message objects, not strings
-            output_key="output"
+        # Optional: enforce a window by manually trimming (simple implementation)
+        self.window_size = window_size  # number of messages to keep (or pairs)
+
+        self.system_prompt = (
+            "You are a helpful AI assistant. Answer concisely and accurately."
         )
-        self.system_prompt =system_prompt or self._default_system_prompt()
 
-    def _default_system_prompt(self) -> str:
-        return (
-            "You are a helpful AI assistant with access to tools."
-            "Use tools when you need real time information or to perform actions. "
-            "Think step by step. Be concise, accurate and helpful. "
-
-        )
-    def get_memory(self) -> ConversationBufferWindowMemory:
-        """Return the raw langchain memory object (Pass the AgentExecutor). """
-        return self.memory
-
-    def get_history(self) -> list:
-        """Return message history as a list"""
-        return self.memory.chat_memory.messages
+    def get_memory(self) -> BaseChatMessageHistory:
+        """Return the history object to pass to RunnableWithMessageHistory"""
+        return self.chat_history
 
     def clear(self):
-        """Reset conversation history."""
-        self.memory.clear()
+        """Clear conversation history"""
+        self.chat_history.clear()
+
+    def trim_if_needed(self):
+        """Simple window: keep only the last N messages (optional)"""
+        messages = self.chat_history.messages
+        if len(messages) > self.window_size:
+            # Keep system prompt if present + last window_size messages
+            self.chat_history.messages = messages[-self.window_size:]
+
+    def add_user_message(self, content: str):
+        self.chat_history.add_message(HumanMessage(content=content))
+        self.trim_if_needed()
+
+    def add_ai_message(self, content: str):
+        self.chat_history.add_message(AIMessage(content=content))
+        self.trim_if_needed()
 
     def __len__(self):
-        return len(self.memory.chat_memory.messages)
+        return len(self.chat_history.messages)

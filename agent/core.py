@@ -1,135 +1,161 @@
-from langchain_classic.agents import create_react_agent, AgentExecutor
+from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
-
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.language_models import BaseChatModel
-
+from langchain_core.runnables.history import RunnableWithMessageHistory
 
 from config.setting import (
     LLM_PROVIDER,
-    OPENAI_API_KEY,OPENAI_MODEL,
-    ANTHROPIC_API_KEY,ANTHROPIC_MODEL,
-    TEMPERATURE,MAX_ITERATIONS
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
+    ANTHROPIC_API_KEY,
+    ANTHROPIC_MODEL,
+    TEMPERATURE,
+    MAX_ITERATIONS
 )
+
 from agent.memory import AgentMemory
 from agent.tools import ALL_TOOLS
 
+
 class Agent:
     """
-    AI Agent build with LangChain.
+    Modern LangChain agent using tool-calling + RunnableWithMessageHistory.
+    Compatible with LangChain 0.3+ / 1.0+ (no more memory= deprecation issues).
     """
 
     def __init__(self):
-        """
-        Assemble the LangChain Agent pipeline.
-        The pipeline is: LLM + Tools + Prompt + Memory + AgentExecutor
-        AgentExecutor is the equivalent of entire _run_loop() method.
-        """
+        """Initialize LLM, memory, prompt, agent and executor."""
+        # Provider & memory first
+        self.provider = LLM_PROVIDER.lower().strip()
+        self.memory = AgentMemory()           # contains .chat_history (BaseChatMessageHistory)
 
-        # 1. Get the LLM
-        self.provider = LLM_PROVIDER
-        self.memory = AgentMemory()
-        llm =self._get_llm()
+        # LLM
+        self.llm = self._get_llm()
 
-        # 2. Build the prompt template.
-        # MessagesPlaceholder is a slot where LangChain injects
-        # chat history and agent scratchpad automatically
-
-        prompt = ChatPromptTemplate.from_messages([
+        # Prompt
+        self.prompt = ChatPromptTemplate.from_messages([
             ("system", self.memory.system_prompt),
-            MessagesPlaceholder(variable_name="chat_history"), # memory goes here
+            MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad") #tool calls goes here.
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
 
-        # 3. Create the ReAct agent
-        # This is the reasoning engine - it's implement the
-        # Thought -> Action -> observation loop.
-
-        react_agent = create_react_agent(
-            llm = llm,
-            tools = ALL_TOOLS,
-            prompt = prompt
+        # Tool-calling agent
+        agent_runnable = create_tool_calling_agent(
+            llm=self.llm,
+            tools=ALL_TOOLS,
+            prompt=self.prompt,
         )
 
-        # 4. Wrap in AgentExecutor
-        #  This is the loop runner  - equivalent to while loop.
-        self.executor = AgentExecutor(
-            agent = react_agent,
-            tools = ALL_TOOLS,
-            memory = self.memory.get_memory(),
-            max_iterations = MAX_ITERATIONS,    # MAX_ITERATION guard
-            verbose = True,                     # prints Thought/Action/Observation
-            handle_parsing_errors =True,        # gracefully handle LLM format errors
-            return_intermediate_steps = True    # capture tool usage for logging
+        # Executor without memory= (legacy field)
+        executor = AgentExecutor(
+            agent=agent_runnable,
+            tools=ALL_TOOLS,
+            verbose=True,
+            handle_parsing_errors=True,
+            max_iterations=MAX_ITERATIONS,
+            return_intermediate_steps=True,
+        )
+
+        # ─── Modern memory injection ───
+        self.executor_with_history = RunnableWithMessageHistory(
+            runnable=executor,
+            get_session_history=lambda session_id: self.memory.get_memory(),
+            input_messages_key="input",
+            history_messages_key="chat_history",
+            # Optional: if you later want per-user conversations
+            # history_factory_config={"session_id": "configurable"}
         )
 
     def _get_llm(self) -> BaseChatModel:
-        """
-        Return the correct LangChain LLM object based on provider.
-
-        Both ChatOpenAI ChatAnthropic implement BaseChatModel.
-        so the rest of the code never needs to know which one is active.
-        This is the strategy pattern - same interface, swappable implementation.
-        """
+        """Factory for current LLM."""
         if self.provider == "openai":
+            if not OPENAI_API_KEY:
+                raise ValueError("OPENAI_API_KEY not set")
             return ChatOpenAI(
-                api_key = OPENAI_API_KEY,
-                model = OPENAI_MODEL,
-                temperature= TEMPERATURE
+                api_key=OPENAI_API_KEY,
+                model=OPENAI_MODEL,
+                temperature=TEMPERATURE,
             )
         elif self.provider == "anthropic":
+            if not ANTHROPIC_API_KEY:
+                raise ValueError("ANTHROPIC_API_KEY not set")
             return ChatAnthropic(
-                api_key =ANTHROPIC_API_KEY,
-                model= ANTHROPIC_MODEL,
-                temperature = TEMPERATURE
+                api_key=ANTHROPIC_API_KEY,
+                model=ANTHROPIC_MODEL,
+                temperature=TEMPERATURE,
             )
         else:
-            raise ValueError(
-                f"Unknown provider: '{self.provider}'."
-                f"Use 'openai' or 'anthropic'."
-            )
+            raise ValueError(f"Unsupported provider: {self.provider}")
 
-        #------------ Public Interface -----------------------
+    def _rebuild_agent(self):
+        """Rebuild when provider changes (memory preserved)."""
+        self.llm = self._get_llm()
 
-    def chat(self,user_input: str) -> str:
-        """
-        Send a message and get a response.
+        agent_runnable = create_tool_calling_agent(
+            llm=self.llm,
+            tools=ALL_TOOLS,
+            prompt=self.prompt,
+        )
 
-        Internally this calls AgentExecutor.invoke() which:
-        1. Formats the prompt with chat history.
-        2. Calls the LLM.
-        3. Parse the output. (tool call or final answer?)
-        4. If tool: runs it, adds result, loop back to step 2
-        5. If final answer: returns it
-        6. Stops if MAX_ITERATIONS reached
+        executor = AgentExecutor(
+            agent=agent_runnable,
+            tools=ALL_TOOLS,
+            verbose=True,
+            handle_parsing_errors=True,
+            max_iterations=MAX_ITERATIONS,
+            return_intermediate_steps=True,
+        )
 
-        All of that happen in ONE line below.
-        """
+        self.executor_with_history = RunnableWithMessageHistory(
+            runnable=executor,
+            get_session_history=lambda session_id: self.memory.get_memory(),
+            input_messages_key="input",
+            history_messages_key="chat_history",
+        )
+
+    # ────────────────────────────────────────────────
+    # Public methods
+    # ────────────────────────────────────────────────
+
+    def chat(self, user_input: str) -> str:
+        """Run one turn with history automatically handled."""
         try:
-            result = self.executor.invoke({"input": user_input})
-            return result["output"]
+            config = {"configurable": {"session_id": "console_user_1"}}
+            # Use the wrapped runnable (no config needed for single-user)
+            result = self.executor_with_history.invoke(
+                {"input": user_input.strip()},
+                config = config
+            )
+            return result["output"].strip()
         except Exception as e:
             return f"Agent error: {str(e)}"
 
-    def switch_provider(self,provider: str):
-        """
-        Switch LLM at runtime.
-        Rebuilds the agent with the new LLM - memory is preserved.
-        """
-        self.provider =provider
-        self._build_agent()  # rebuild with new LLM, same memory.
-        print(f"[Agent] Switched to: {provider}")
+    def switch_provider(self, provider: str):
+        """Switch LLM and rebuild (memory kept)."""
+        provider = provider.lower().strip()
+        if provider not in ("openai", "anthropic"):
+            return f"[Agent] Unsupported provider: {provider}"
+
+        if provider == self.provider:
+            return f"[Agent] Already using {provider}"
+
+        self.provider = provider
+        self._rebuild_agent()
+        return f"[Agent] Switched to {provider}"
 
     def reset(self):
-        """
-        Clear conversation history.
-        """
+        """Clear history."""
         self.memory.clear()
-        print("[Agent] Conversation reset.")
+        return "[Agent] Conversation history cleared."
 
     def get_message_count(self) -> int:
         return len(self.memory)
 
 
+if __name__ == "__main__":
+    agent = Agent()
+    print(f"Agent ready – provider: {agent.provider}")
+    print(f"Tools: {len(ALL_TOOLS)}")
